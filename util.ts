@@ -76,6 +76,32 @@ export function flattenArraysInObject(input: any, inArray: boolean = false): any
 }
 
 /**
+ * Airbnb wraps user-visible strings in several interchangeable envelopes, and which
+ * one a given field uses has changed under us more than once — `highlights` shipped
+ * as `{ title, subtitle }` and is now `{ headline: { localizedContent }, body: {...} }`.
+ * Reading one shape and returning null on the others is how HIGHLIGHTS_DEFAULT went
+ * silently empty, so unwrap every envelope we have seen rather than betting on one.
+ */
+export function localizedText(value: any): string | undefined {
+  if (typeof value === "string") return value || undefined;
+  if (!value || typeof value !== "object") return undefined;
+  const candidate =
+    value.localizedContent ??
+    value.localizedStringWithTranslationPreference ??
+    value.localizedString ??
+    value.text ??
+    // Both wrap another envelope rather than a string: PdpUGCText nests under
+    // `content`, UGCTextWrapper under `ugcContent`. Highlights use all three forms
+    // across listings on the same day — LISTING_GUEST_FAVORITE arrives as
+    // LocalizedContent, LISTING_CUSTOM_OFFLINE_GENERATED as UGCTextWrapper — so this
+    // is a set to unwrap, not a schema version to pick.
+    value.ugcContent ??
+    value.content;
+  if (candidate && typeof candidate === "object") return localizedText(candidate);
+  return typeof candidate === "string" && candidate ? candidate : undefined;
+}
+
+/**
  * Airbnb moved several PDP sections to client-side rendering. Their entries under
  * `presentation.stayProductDetailPage.sections.sections` still exist, still report
  * sectionContentStatus COMPLETE, but carry a `section` object containing nothing but
@@ -180,15 +206,107 @@ export function extractHighlights(pdp: any): any | null {
   if (!Array.isArray(highlights) || highlights.length === 0) return null;
   const mapped = highlights
     .map((h: any) => {
-      const title = h?.title;
+      // `headline`/`body` is the current shape; `title`/`subtitle` was the previous
+      // one. Both are read because neither is guaranteed to be the one that survives.
+      const title = localizedText(h?.headline) ?? localizedText(h?.title);
       // Interpolating first would turn a missing title into the literal string
       // "null: Free parking on premises", which .filter(Boolean) cannot catch.
       if (!title) return null;
-      // Airbnb has shipped this as both a plain string and a { text } object.
-      const sub = typeof h?.subtitle === "string" ? h.subtitle : h?.subtitle?.text;
+      const sub = localizedText(h?.body) ?? localizedText(h?.subtitle);
       return sub ? `${title}: ${sub}` : title;
     })
     .filter(Boolean);
 
   return mapped.length ? { highlights: mapped } : null;
+}
+
+/**
+ * The listing description, matching the DESCRIPTION_DEFAULT section's own shape so a
+ * consumer cannot tell whether it came from the section tree or the recovery path.
+ */
+export function extractDescription(pdp: any): any | null {
+  const descriptions = pdp?.descriptions;
+  if (!descriptions || typeof descriptions !== "object") return null;
+  const htmlText =
+    localizedText(descriptions.longDescriptionHtml) ??
+    localizedText(descriptions.shortDescriptionHtml);
+  return htmlText ? { htmlDescription: { htmlText } } : null;
+}
+
+/**
+ * Coordinates plus whatever the page says about the area.
+ *
+ * The two sources disagree by listing rather than by schema version: one listing
+ * carries `location.subtitle` and empty detail arrays, the next carries populated
+ * details and a null subtitle. Reading only one yields a section that is present and
+ * blank on half of all listings, so both are consulted and the coordinates — the part
+ * that is always there — are emitted independently of either.
+ */
+export function extractLocation(pdp: any): any | null {
+  const location = pdp?.location;
+  if (!location || typeof location !== "object") return null;
+
+  const details = Array.isArray(location.previewLocationDetails) && location.previewLocationDetails.length
+    ? location.previewLocationDetails
+    : Array.isArray(location.seeAllLocationDetails)
+      ? location.seeAllLocationDetails
+      : [];
+
+  const title =
+    localizedText(location.subtitle) ??
+    localizedText(details[0]?.title) ??
+    localizedText(pdp?.localizedLocation);
+
+  const subtitle = details
+    .map((d: any) => localizedText(d?.content))
+    .filter(Boolean)
+    .join(" ");
+
+  const lat = typeof location.latitude === "number" ? location.latitude : undefined;
+  const lng = typeof location.longitude === "number" ? location.longitude : undefined;
+
+  const result: Record<string, any> = {};
+  if (lat !== undefined) result.lat = lat;
+  if (lng !== undefined) result.lng = lng;
+  if (title) result.title = title;
+  if (subtitle) result.subtitle = subtitle;
+
+  return Object.keys(result).length ? result : null;
+}
+
+/**
+ * House rules, keyed by group title for the same reason amenity groups are: as array
+ * elements the group names survive only as prefixes inside one joined string.
+ *
+ * An item's `description` carries the part that changes the meaning — "Quiet hours"
+ * alone is not a rule until you know it means 6:00 p.m.–10:00 a.m. — so it is folded
+ * into the item text rather than dropped.
+ */
+export function extractHouseRules(pdp: any): any | null {
+  const rules = pdp?.rules;
+  const groups = rules?.groupItems;
+  if (!Array.isArray(groups) || groups.length === 0) return null;
+
+  const keyed: Record<string, string[]> = {};
+  for (const group of groups) {
+    const items = Array.isArray(group?.items) ? group.items : [];
+    const mapped = items
+      .map((item: any) => {
+        const title = localizedText(item?.title);
+        if (!title) return null;
+        const description = localizedText(item?.description);
+        return description ? `${title} (${description})` : title;
+      })
+      .filter(Boolean) as string[];
+    if (!mapped.length) continue;
+    const key = localizedText(group?.title) || "Other";
+    keyed[key] = keyed[key] ? keyed[key].concat(mapped) : mapped;
+  }
+
+  if (!Object.keys(keyed).length) return null;
+
+  return {
+    ...(localizedText(rules?.title) ? { title: localizedText(rules.title) } : {}),
+    houseRulesSections: keyed,
+  };
 }

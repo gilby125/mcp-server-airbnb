@@ -11,7 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
-import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups } from "./util.js";
+import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, extractDescription, extractLocation, extractHouseRules, keyAmenityGroups } from "./util.js";
 import robotsParser from "robots-parser";
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -88,12 +88,16 @@ const AIRBNB_SEARCH_TOOL: Tool = {
         enum: ["entire_home", "private_room", "shared_room", "hotel_room"],
         description: "Filter by property type: 'entire_home' (entire homes/apartments), 'private_room' (private rooms in shared homes), 'shared_room' (shared/dorm-style rooms), 'hotel_room' (hotel rooms)"
       },
+      currency: {
+        type: "string",
+        description: "ISO currency code for prices (e.g. USD, EUR, GBP). Defaults to whatever Airbnb picks for your IP's country, which is not necessarily your own \u2014 set this explicitly when on a VPN."
+      },
       ignoreRobotsText: {
         type: "boolean",
         description: "Ignore robots.txt rules for this request"
       }
     },
-    required: ["location"]
+    anyOf: [{ required: ["location"] }, { required: ["placeId"] }]
   }
 };
 
@@ -131,6 +135,10 @@ const AIRBNB_LISTING_DETAILS_TOOL: Tool = {
         type: "number",
         description: "Number of pets"
       },
+      currency: {
+        type: "string",
+        description: "ISO currency code for prices (e.g. USD, EUR, GBP). Defaults to whatever Airbnb picks for your IP's country, which is not necessarily your own \u2014 set this explicitly when on a VPN."
+      },
       ignoreRobotsText: {
         type: "boolean",
         description: "Ignore robots.txt rules for this request"
@@ -151,24 +159,34 @@ const BASE_URL = "https://www.airbnb.com";
 
 // Geocode location using Photon (fast, no rate limits) with Nominatim fallback.
 // This bypasses Airbnb's broken server-side geocoding for non-US locations.
-// Photon doesn't rank by importance, so we fetch multiple results and prefer
-// cities/states/countries over hamlets/houses/POIs.
-const PHOTON_TYPE_PRIORITY: Record<string, number> = {
-  country: 1, state: 2, county: 3, city: 4, district: 5,
-  locality: 6, street: 7, house: 8, other: 9,
-};
+// We fetch several results because the top hit is sometimes a landmark rather than
+// the place itself, and because the best match may lack a bounding box.
+
+// Types too granular to be what someone searching for a place to stay meant. A query
+// for "Pensacola, FL" matches the naval air station and the federal prison camp; those
+// are the results worth skipping past.
+const PHOTON_REJECTED_TYPES = new Set(["house", "street", "other"]);
 
 function pickBestPhotonFeature(features: any[]): any | null {
-  // Pick the feature with the highest-priority type (city > hamlet > house etc).
+  // Take Photon's own top-ranked result, skipping only the granular types above.
+  //
+  // An earlier version ranked by an administrative-breadth table instead, on the
+  // theory that broader is safer. It is not: a city and its province routinely share
+  // a name, the province is always the broader type, so the table picked the province
+  // every time. "Barcelona" resolved to a 190km box spanning Catalonia and returned
+  // Costa Brava listings. Photon already ranks by relevance and put the city first in
+  // every case checked (Barcelona, Paris, Stockholm, New York, Austin, Pensacola);
+  // overriding that ranking was the whole bug.
+  //
   // Don't filter by extent here — the best match (e.g. Stockholm, Sweden) may
   // lack an extent, and we'll fall back to Nominatim for the bbox.
   if (!features || features.length === 0) return null;
 
-  return features.reduce((best: any, f: any) => {
-    const bestPri = PHOTON_TYPE_PRIORITY[best.properties?.type] ?? PHOTON_TYPE_PRIORITY.other;
-    const fPri = PHOTON_TYPE_PRIORITY[f.properties?.type] ?? PHOTON_TYPE_PRIORITY.other;
-    return fPri < bestPri ? f : best;
-  });
+  const acceptable = features.find(
+    (f: any) => !PHOTON_REJECTED_TYPES.has(f?.properties?.type)
+  );
+  // If everything matched a rejected type, the top hit is still better than nothing.
+  return acceptable ?? features[0];
 }
 
 async function geocodeLocation(location: string): Promise<{
@@ -301,8 +319,17 @@ const IGNORE_ROBOTS_TXT = process.env.IGNORE_ROBOTS_TXT === "true" || process.ar
 // fix for non-US locations stays on by default; users who want zero third-party
 // outbound calls can opt out by setting DISABLE_GEOCODING=true.
 const DISABLE_GEOCODING = process.env.DISABLE_GEOCODING === "true";
+// Airbnb prices in the currency of the country domain it handed us off to, which
+// follows the request's IP — so a VPN silently changes every price in the results.
+// Set a default here to pin it regardless of where the connection appears to come from.
+const DEFAULT_CURRENCY = process.env.AIRBNB_CURRENCY || "";
 
-const robotsErrorMessage = "This path is disallowed by Airbnb's robots.txt to this User-agent. You may or may not want to run the server with '--ignore-robots-txt' args"
+// Airbnb's robots.txt carries `Disallow: /s/*/*` under `User-agent: *`, which matches
+// every URL airbnb_search builds — so with the default posture this tool cannot succeed
+// at all. That is a deliberate choice by Airbnb, not a bug here, but the previous
+// message ("you may or may not want to...") left callers guessing, so say plainly what
+// is blocked and what the one option is.
+const robotsErrorMessage = "Airbnb's robots.txt disallows this path for this User-agent. Airbnb blocks all /s/ search URLs (Disallow: /s/*/*), so airbnb_search cannot run under the default robots.txt-respecting posture. To proceed anyway, start the server with '--ignore-robots-txt', set IGNORE_ROBOTS_TXT=true, or pass ignoreRobotsText: true on the request \u2014 doing so is a decision to override the site's stated crawling preference."
 let robotsTxtContent = "";
 
 // Enhanced robots.txt fetch with timeout and error handling
@@ -368,7 +395,7 @@ function isPathAllowed(path: string): boolean {
 async function fetchWithUserAgent(url: string, timeout: number = 30000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
-  
+
   try {
     const response = await fetch(url, {
       headers: {
@@ -379,22 +406,113 @@ async function fetchWithUserAgent(url: string, timeout: number = 30000) {
       },
       signal: controller.signal
     });
-    
+
     clearTimeout(timeoutId);
-    
+
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
-    
+
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
-    
+
     if (error instanceof Error && error.name === 'AbortError') {
       throw new Error(`Request timeout after ${timeout}ms`);
     }
-    
+
     throw error;
+  }
+}
+
+// Airbnb geo-redirects www.airbnb.com to a country domain (www.airbnb.ca, .co.uk, …)
+// using an HTML form that JavaScript submits on load — not an HTTP 3xx. fetch follows
+// redirects but cannot run scripts, so from outside the US every request returned a
+// ~900-byte stub with none of the page data in it. That surfaced as "page structure
+// may have changed" on both tools, for every non-US user, permanently.
+//
+// The stub names its own target in the form action, so read it, remember the origin,
+// and retry there. Cached for the process: the answer is per-IP, not per-URL.
+let resolvedOrigin: string | null = null;
+
+const DOMAIN_HANDOFF_PATTERN = /<form[^>]*action="(https:\/\/[^"/]+)\/v2\/domain_switch\/handoff"/i;
+
+function withResolvedOrigin(url: string): string {
+  if (!resolvedOrigin) return url;
+  const target = new URL(url);
+  const origin = new URL(resolvedOrigin);
+  target.protocol = origin.protocol;
+  target.host = origin.host;
+  return target.toString();
+}
+
+// The stub is under a kilobyte and a real listing page is ~850KB, so scanning only the
+// head of the document keeps this free on the responses that actually matter.
+function detectDomainHandoff(html: string): string | null {
+  const match = html.slice(0, 4096).match(DOMAIN_HANDOFF_PATTERN);
+  return match ? match[1] : null;
+}
+
+async function fetchPage(url: string, timeout: number = 30000): Promise<{ html: string; url: string }> {
+  let target = withResolvedOrigin(url);
+  let html = await (await fetchWithUserAgent(target, timeout)).text();
+
+  const handoff = detectDomainHandoff(html);
+  if (!handoff) return { html, url: target };
+
+  const previousOrigin = resolvedOrigin;
+  resolvedOrigin = handoff;
+  const retryTarget = withResolvedOrigin(url);
+
+  // Only retry when the origin actually moved. Retrying the same URL because it
+  // handed off to itself is a loop, not a fix.
+  if (retryTarget === target) {
+    resolvedOrigin = previousOrigin;
+    return { html, url: target };
+  }
+
+  log('info', 'Following Airbnb domain handoff', { from: target, to: retryTarget });
+  target = retryTarget;
+  html = await (await fetchWithUserAgent(target, timeout)).text();
+
+  if (detectDomainHandoff(html)) {
+    // Nowhere better to go. Return what we have and let the parse path report it.
+    log('warn', 'Domain handoff repeated after retry', { url: target });
+  }
+
+  return { html, url: target };
+}
+
+/**
+ * Airbnb's deferred state is an array of query results, and which slot holds the
+ * search is not fixed — `niobeClientData[0][1]` was an assumption, not a contract.
+ * Scan for the entry that actually carries the results instead.
+ */
+function findSearchResults(clientData: any): any | null {
+  const entries = clientData?.niobeClientData;
+  if (!Array.isArray(entries)) return null;
+  for (const entry of entries) {
+    const results = entry?.[1]?.data?.presentation?.staysSearch?.results;
+    if (results && Array.isArray(results.searchResults)) return results;
+  }
+  return null;
+}
+
+/**
+ * Listing ids arrive base64-encoded as "DemandStayListing:1234". Returns null rather
+ * than throwing for anything that is not that, so a single malformed card is skipped
+ * instead of failing the search.
+ */
+function decodeListingId(encoded: any): string | null {
+  if (typeof encoded !== "string" || !encoded) return null;
+  try {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const id = decoded.includes(":") ? decoded.split(":")[1] : decoded;
+    // A wrong guess at the encoding decodes to mojibake, which would otherwise sail
+    // through as a plausible-looking id and produce a 404 link.
+    return /^\d+$/.test(id) ? id : null;
+  } catch {
+    return null;
   }
 }
 
@@ -413,6 +531,7 @@ async function handleAirbnbSearch(params: any) {
     maxPrice,
     cursor,
     propertyType,
+    currency = DEFAULT_CURRENCY,
     ignoreRobotsText = false,
   } = params;
 
@@ -420,10 +539,26 @@ async function handleAirbnbSearch(params: any) {
   // Airbnb path segments use "--" as the separator (e.g. "Paris--France"),
   // not URL-encoded punctuation.  encodeURIComponent turns commas into %2C
   // which confuses Airbnb's geocoder (e.g. Paris → Barneville-Carteret).
-  const slug = location
-    .replace(/,\s*/g, "--")   // "Paris, France" → "Paris--France"
-    .replace(/\s+/g, "-");    // remaining spaces → single dash
-  const searchUrl = new URL(`${BASE_URL}/s/${encodeURIComponent(slug)}/homes`);
+  //
+  // `location` is only required when there is no placeId. The schema has always said
+  // placeId overrides location, but the slug was built unconditionally, so passing a
+  // placeId alone crashed on `location.replace` — the low-level MCP Server does not
+  // validate arguments against inputSchema, so nothing caught it earlier.
+  if (!location && !placeId) {
+    throw new McpError(ErrorCode.InvalidParams, "Either 'location' or 'placeId' is required");
+  }
+  const searchPath = location
+    ? `/s/${encodeURIComponent(
+        location
+          .replace(/,\s*/g, "--")   // "Paris, France" → "Paris--France"
+          .replace(/\s+/g, "-")     // remaining spaces → single dash
+      )}/homes`
+    : "/s/homes";                   // Airbnb's own form when the place comes from place_id
+  const searchUrl = new URL(`${BASE_URL}${searchPath}`);
+  // The URL actually fetched, which differs from searchUrl once a domain handoff is
+  // followed. Reporting the pre-handoff URL would hand the caller a link that returns
+  // a redirect stub rather than the results they were just shown.
+  let fetchedUrl = searchUrl.toString();
   
   // Add placeId
   if (placeId) searchUrl.searchParams.append("place_id", placeId);
@@ -431,7 +566,7 @@ async function handleAirbnbSearch(params: any) {
   // Geocode and add bounding box to fix broken server-side geocoding.
   // Skipped when placeId is supplied (Airbnb's place lookup is reliable for those)
   // or when DISABLE_GEOCODING=true (user opt-out from third-party calls).
-  if (!placeId && !DISABLE_GEOCODING) {
+  if (!placeId && location && !DISABLE_GEOCODING) {
     const coords = await geocodeLocation(location);
     if (coords) {
       searchUrl.searchParams.append("ne_lat", coords.ne_lat);
@@ -472,6 +607,8 @@ async function handleAirbnbSearch(params: any) {
   if (cursor) {
     searchUrl.searchParams.append("cursor", cursor);
   }
+
+  if (currency) searchUrl.searchParams.append("currency", currency);
 
   // Check if path is allowed by robots.txt
   const path = searchUrl.pathname + searchUrl.search;
@@ -540,10 +677,10 @@ async function handleAirbnbSearch(params: any) {
   try {
     log('info', 'Performing Airbnb search', { location, checkin, checkout, adults, children });
     
-    const response = await fetchWithUserAgent(searchUrl.toString());
-    const html = await response.text();
-    const $ = cheerio.load(html);
-    
+    const page = await fetchPage(searchUrl.toString());
+    fetchedUrl = page.url;
+    const $ = cheerio.load(page.html);
+
     let staysSearchResults: any = {};
     let scriptContent = '';
     
@@ -559,21 +696,36 @@ async function handleAirbnbSearch(params: any) {
       }
       
       const clientData = JSON.parse(scriptContent);
-      const results = clientData.niobeClientData[0][1].data.presentation.staysSearch.results;
+      const results = findSearchResults(clientData);
+      if (!results) {
+        throw new Error("Could not locate staysSearch results in the page data");
+      }
       cleanObject(results);
-      
+
+      const rawResults: any[] = Array.isArray(results.searchResults) ? results.searchResults : [];
+      let skipped = 0;
+
       staysSearchResults = {
-        searchResults: results.searchResults
-          .map((result: any) => flattenArraysInObject(pickBySchema(result, allowSearchResultSchema)))
+        searchResults: rawResults
           .map((result: any) => {
-            const id = atob(result.demandStayListing.id).split(":")[1];
-            return {id, url: `${BASE_URL}/rooms/${id}`, ...result }
-          }),
+            // One unexpected card must not cost the caller the other seventeen. Airbnb
+            // mixes non-listing entries into searchResults, and an entry without an
+            // encoded id used to throw here and fail the whole search as a parse error.
+            const shaped = flattenArraysInObject(pickBySchema(result, allowSearchResultSchema));
+            const id = decodeListingId(shaped?.demandStayListing?.id);
+            if (!id) {
+              skipped++;
+              return null;
+            }
+            return { id, url: `${withResolvedOrigin(BASE_URL)}/rooms/${id}`, ...shaped };
+          })
+          .filter(Boolean),
         paginationInfo: results.paginationInfo
       }
-      
-      log('info', 'Search completed successfully', { 
-        resultCount: staysSearchResults.searchResults?.length || 0 
+
+      log('info', 'Search completed successfully', {
+        resultCount: staysSearchResults.searchResults?.length || 0,
+        skippedResults: skipped || undefined
       });
     } catch (parseError) {
       let parsedRaw: any = null;
@@ -584,7 +736,7 @@ async function handleAirbnbSearch(params: any) {
       log('error', 'Failed to parse search results', {
         error: parseError instanceof Error ? parseError.message : String(parseError),
         diagnosis,
-        url: searchUrl.toString()
+        url: fetchedUrl
       });
       
       return {
@@ -594,7 +746,7 @@ async function handleAirbnbSearch(params: any) {
             error: "Failed to parse search results from Airbnb. The page structure may have changed.",
             details: parseError instanceof Error ? parseError.message : String(parseError),
             diagnosis,
-            searchUrl: searchUrl.toString()
+            searchUrl: fetchedUrl
           }, null, 2)
         }],
         isError: true
@@ -605,7 +757,7 @@ async function handleAirbnbSearch(params: any) {
       content: [{
         type: "text",
         text: JSON.stringify({
-          searchUrl: searchUrl.toString(),
+          searchUrl: fetchedUrl,
           ...staysSearchResults
         }, null, 2)
       }],
@@ -614,7 +766,7 @@ async function handleAirbnbSearch(params: any) {
   } catch (error) {
     log('error', 'Search request failed', {
       error: error instanceof Error ? error.message : String(error),
-      url: searchUrl.toString()
+      url: fetchedUrl
     });
     
     return {
@@ -622,7 +774,7 @@ async function handleAirbnbSearch(params: any) {
         type: "text",
         text: JSON.stringify({
           error: error instanceof Error ? error.message : String(error),
-          searchUrl: searchUrl.toString(),
+          searchUrl: fetchedUrl,
           timestamp: new Date().toISOString()
         }, null, 2)
       }],
@@ -640,11 +792,14 @@ async function handleAirbnbListingDetails(params: any) {
     children = 0,
     infants = 0,
     pets = 0,
+    currency = DEFAULT_CURRENCY,
     ignoreRobotsText = false,
   } = params;
 
   // Build listing URL
   const listingUrl = new URL(`${BASE_URL}/rooms/${id}`);
+  // See the note on fetchedUrl in handleAirbnbSearch.
+  let fetchedListingUrl = listingUrl.toString();
   
   // Add query parameters
   if (checkin) listingUrl.searchParams.append("check_in", checkin);
@@ -663,6 +818,8 @@ async function handleAirbnbListingDetails(params: any) {
     listingUrl.searchParams.append("infants", infants_int.toString());
     listingUrl.searchParams.append("pets", pets_int.toString());
   }
+
+  if (currency) listingUrl.searchParams.append("currency", currency);
 
   // Check if path is allowed by robots.txt
   const path = listingUrl.pathname + listingUrl.search;
@@ -722,9 +879,9 @@ async function handleAirbnbListingDetails(params: any) {
   try {
     log('info', 'Fetching listing details', { id, checkin, checkout, adults, children });
     
-    const response = await fetchWithUserAgent(listingUrl.toString());
-    const html = await response.text();
-    const $ = cheerio.load(html);
+    const page = await fetchPage(listingUrl.toString());
+    fetchedListingUrl = page.url;
+    const $ = cheerio.load(page.html);
     
     // Always an array. A consumer doing details.find(...) should never meet an object.
     let details: any[] = [];
@@ -766,6 +923,9 @@ async function handleAirbnbListingDetails(params: any) {
         const fromPdp: Record<string, { value: any | null; contentKey: string }> = {
           AMENITIES_DEFAULT: { value: extractAmenities(pdp), contentKey: "seeAllAmenitiesGroups" },
           HIGHLIGHTS_DEFAULT: { value: extractHighlights(pdp), contentKey: "highlights" },
+          DESCRIPTION_DEFAULT: { value: extractDescription(pdp), contentKey: "htmlDescription" },
+          LOCATION_DEFAULT: { value: extractLocation(pdp), contentKey: "lat" },
+          POLICIES_DEFAULT: { value: extractHouseRules(pdp), contentKey: "houseRulesSections" },
         };
 
         extracted = extracted.map((section: any) => {
@@ -806,7 +966,7 @@ async function handleAirbnbListingDetails(params: any) {
         error: parseError instanceof Error ? parseError.message : String(parseError),
         diagnosis,
         id,
-        url: listingUrl.toString()
+        url: fetchedListingUrl
       });
       
       return {
@@ -816,7 +976,7 @@ async function handleAirbnbListingDetails(params: any) {
             error: "Failed to parse listing details from Airbnb. The page structure may have changed.",
             details: parseError instanceof Error ? parseError.message : String(parseError),
             diagnosis,
-            listingUrl: listingUrl.toString()
+            listingUrl: fetchedListingUrl
           }, null, 2)
         }],
         isError: true
@@ -827,7 +987,7 @@ async function handleAirbnbListingDetails(params: any) {
       content: [{
         type: "text",
         text: JSON.stringify({
-          listingUrl: listingUrl.toString(),
+          listingUrl: fetchedListingUrl,
           details: details
         }, null, 2)
       }],
@@ -837,7 +997,7 @@ async function handleAirbnbListingDetails(params: any) {
     log('error', 'Listing details request failed', {
       error: error instanceof Error ? error.message : String(error),
       id,
-      url: listingUrl.toString()
+      url: fetchedListingUrl
     });
     
     return {
@@ -845,7 +1005,7 @@ async function handleAirbnbListingDetails(params: any) {
         type: "text",
         text: JSON.stringify({
           error: error instanceof Error ? error.message : String(error),
-          listingUrl: listingUrl.toString(),
+          listingUrl: fetchedListingUrl,
           timestamp: new Date().toISOString()
         }, null, 2)
       }],
@@ -883,6 +1043,7 @@ log('info', 'Airbnb MCP Server starting', {
   version: VERSION,
   ignoreRobotsTxt: IGNORE_ROBOTS_TXT,
   disableGeocoding: DISABLE_GEOCODING,
+  defaultCurrency: DEFAULT_CURRENCY || undefined,
   nodeVersion: process.version,
   platform: process.platform
 });

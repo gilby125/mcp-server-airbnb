@@ -143,19 +143,35 @@ class MCPTester {
       }
       
       const content = JSON.parse(result.content[0].text);
-      
+
+      // This used to `return true` on any error, with a comment calling it expected
+      // behaviour. It is not: the call passes ignoreRobotsText, so a robots.txt refusal
+      // here would itself be a bug. Treating every failure as a pass is why this file
+      // printed "All tests passed" while search was returning an error on every run.
       if (content.error) {
-        console.log('⚠️  Search returned error (expected for robots.txt):', content.error);
-        return true; // This is expected behavior
+        console.error('❌ airbnb_search returned an error:', content.error);
+        if (content.diagnosis) console.error('   diagnosis:', content.diagnosis);
+        return false;
       }
-      
-      if (content.searchResults) {
-        console.log(`✅ Search successful, found ${content.searchResults.length} results`);
-        if (content.searchResults.length > 0) {
-          console.log(`   First result: ${content.searchResults[0].id}`);
-        }
+
+      if (!Array.isArray(content.searchResults)) {
+        console.error('❌ airbnb_search returned no searchResults array');
+        return false;
       }
-      
+
+      if (content.searchResults.length === 0) {
+        console.error('❌ airbnb_search returned zero results for a major city');
+        return false;
+      }
+
+      const first = content.searchResults[0];
+      if (!first.id || !first.url) {
+        console.error('❌ First result is missing id/url:', JSON.stringify(first).slice(0, 200));
+        return false;
+      }
+
+      console.log(`✅ Search successful, found ${content.searchResults.length} results`);
+      console.log(`   First result: ${first.id} → ${first.url}`);
       return true;
     } catch (error) {
       console.error('❌ airbnb_search test failed:', error.message);
@@ -185,13 +201,36 @@ class MCPTester {
       }
       
       const content = JSON.parse(result.content[0].text);
-      
+
+      // Same false-green as testSearchTool: this returned true on any error, blaming a
+      // "dummy ID" for a call that uses a real listing.
       if (content.error) {
-        console.log('⚠️  Listing details returned error (expected for dummy ID):', content.error);
-        return true; // This is expected behavior
+        console.error('❌ airbnb_listing_details returned an error:', content.error);
+        if (content.diagnosis) console.error('   diagnosis:', content.diagnosis);
+        return false;
       }
-      
-      console.log('✅ Listing details tool responded correctly');
+
+      const details = content.details;
+      if (!Array.isArray(details) || details.length === 0) {
+        console.error('❌ airbnb_listing_details returned no sections');
+        return false;
+      }
+
+      // Airbnb renders these five client-side now, leaving `{__typename}`-only stubs in
+      // the section tree. They are recovered from pdpPresentation, and a section that
+      // comes back carrying nothing but its own id means that recovery has broken —
+      // which is exactly the silent regression this suite previously waved through.
+      const empty = details
+        .filter((d) => Object.keys(d).filter((k) => k !== 'id').length === 0)
+        .map((d) => d.id);
+
+      if (empty.length > 0) {
+        console.error(`❌ Sections returned with no content: ${empty.join(', ')}`);
+        return false;
+      }
+
+      console.log(`✅ Listing details returned ${details.length} populated sections`);
+      console.log(`   ${details.map((d) => d.id).join(', ')}`);
       return true;
     } catch (error) {
       console.error('❌ airbnb_listing_details test failed:', error.message);
