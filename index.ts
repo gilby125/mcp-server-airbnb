@@ -717,7 +717,7 @@ async function handleAirbnbSearch(params: any) {
               skipped++;
               return null;
             }
-            return { id, url: `${withResolvedOrigin(BASE_URL)}/rooms/${id}`, ...shaped };
+            return { id, url: `${resolvedOrigin ?? BASE_URL}/rooms/${id}`, ...shaped };
           })
           .filter(Boolean),
         paginationInfo: results.paginationInfo
