@@ -374,6 +374,13 @@ async function fetchWithUserAgent(url, timeout = 30000) {
             signal: controller.signal
         });
         clearTimeout(timeoutId);
+        if (response.status === 429 || response.status === 503) {
+            // Airbnb sends no Retry-After, and the throttle observed here cleared within about
+            // a minute — so report it as the transient condition it is rather than as a
+            // generic HTTP failure the caller might read as permanent.
+            throw new Error(`Rate limited by Airbnb (HTTP ${response.status}). This is transient — wait a minute and retry, ` +
+                `and space out bulk searches rather than issuing them back to back.`);
+        }
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -481,6 +488,26 @@ function decodeListingId(encoded) {
  * both cases. Reporting the box size next to the ceiling is what makes an over-broad
  * search legible as a sparse sample rather than a survey.
  */
+/**
+ * A missing data script has two very different causes, and calling both of them "the page
+ * structure may have changed" sends the reader to the wrong place.
+ *
+ * Airbnb soft-blocks by answering 200 with a short page carrying no data, which is what a
+ * burst of requests produces — no 429, no Retry-After. A real markup change, by contrast,
+ * arrives as a full-size page that simply no longer holds the element we want. Size
+ * separates them cleanly: a populated listing or search page runs several hundred KB,
+ * while the block page is a small fraction of that.
+ */
+function describeMissingDataScript(html) {
+    const kb = Math.round(html.length / 1024);
+    if (html.length < SOFT_BLOCK_MAX_BYTES) {
+        return `Airbnb returned a ${kb}KB page with no listing data — almost certainly a soft rate-limit ` +
+            `block rather than a page-structure change. Wait a minute and retry, and space out bulk searches.`;
+    }
+    return `Could not find data script element in a ${kb}KB page - page structure may have changed`;
+}
+// A real page is ~850KB; the block page is a small fraction of that.
+const SOFT_BLOCK_MAX_BYTES = 100 * 1024;
 const PAGE_SLOTS = 18;
 function buildSearchMetadata(searchUrl, resultCount, pageCursors, skipped) {
     const num = (key) => {
@@ -666,7 +693,7 @@ async function handleAirbnbSearch(params) {
         try {
             const scriptElement = $("#data-deferred-state-0").first();
             if (scriptElement.length === 0) {
-                throw new Error("Could not find data script element - page structure may have changed");
+                throw new Error(describeMissingDataScript(page.html));
             }
             scriptContent = $(scriptElement).text();
             if (!scriptContent) {
@@ -846,7 +873,7 @@ async function handleAirbnbListingDetails(params) {
         try {
             const scriptElement = $("#data-deferred-state-0").first();
             if (scriptElement.length === 0) {
-                throw new Error("Could not find data script element - page structure may have changed");
+                throw new Error(describeMissingDataScript(page.html));
             }
             scriptContent = $(scriptElement).text();
             if (!scriptContent) {
