@@ -25,7 +25,13 @@ const VERSION = getVersion();
 // Tool definitions
 const AIRBNB_SEARCH_TOOL = {
     name: "airbnb_search",
-    description: "Search for Airbnb listings with various filters and pagination. Provide direct links to the user",
+    description: "Search for Airbnb listings with various filters and pagination. Provide direct links to the user. " +
+        "ALWAYS pass checkin and checkout when comparing prices: without them Airbnb picks a different, " +
+        "self-selected cheap date window per listing (measured: 12 distinct windows across 18 results), so the " +
+        "prices returned are not comparable to each other. " +
+        "One query returns at most ~270 listings (18 per page x 15 pages) no matter how large the search area is, " +
+        "so a country-sized search is a sparse sample, not a survey \u2014 to cover a region, run several " +
+        "narrower searches instead of one wide one.",
     inputSchema: {
         type: "object",
         properties: {
@@ -39,11 +45,11 @@ const AIRBNB_SEARCH_TOOL = {
             },
             checkin: {
                 type: "string",
-                description: "Check-in date (YYYY-MM-DD)"
+                description: "Check-in date (YYYY-MM-DD). Omit only when you do not care about price: without a fixed date range Airbnb returns a different date window per listing, making the prices incomparable."
             },
             checkout: {
                 type: "string",
-                description: "Check-out date (YYYY-MM-DD)"
+                description: "Check-out date (YYYY-MM-DD). See checkin \u2014 supply both or neither."
             },
             adults: {
                 type: "number",
@@ -71,7 +77,7 @@ const AIRBNB_SEARCH_TOOL = {
             },
             cursor: {
                 type: "string",
-                description: "Base64-encoded string used for Pagination"
+                description: "Base64-encoded pagination cursor, taken from paginationInfo.pageCursors of a previous response. There are 15 pages of 18 results; searchMetadata.maxRetrievableResults reports the ceiling for the current query."
             },
             propertyType: {
                 type: "string",
@@ -92,7 +98,8 @@ const AIRBNB_SEARCH_TOOL = {
 };
 const AIRBNB_LISTING_DETAILS_TOOL = {
     name: "airbnb_listing_details",
-    description: "Get detailed information about a specific Airbnb listing. Provide direct links to the user",
+    description: "Get detailed information about a specific Airbnb listing (location, house rules, highlights, description, " +
+        "amenities). Provide direct links to the user. Pass checkin/checkout to price a specific stay.",
     inputSchema: {
         type: "object",
         properties: {
@@ -464,6 +471,55 @@ function decodeListingId(encoded) {
         return null;
     }
 }
+/**
+ * What the caller cannot otherwise see: which box was actually searched, and how much of
+ * it this response represents.
+ *
+ * The bounding box was only recoverable by re-parsing searchUrl, and the 270-result
+ * ceiling (15 pages x 18) was not discoverable at all — a query over a 1100km box and one
+ * over a 38km box return the same count, so "18 results" reads like the whole answer in
+ * both cases. Reporting the box size next to the ceiling is what makes an over-broad
+ * search legible as a sparse sample rather than a survey.
+ */
+const PAGE_SLOTS = 18;
+function buildSearchMetadata(searchUrl, resultCount, pageCursors, skipped) {
+    const num = (key) => {
+        const raw = searchUrl.searchParams.get(key);
+        if (raw === null)
+            return null;
+        const parsed = parseFloat(raw);
+        return Number.isFinite(parsed) ? parsed : null;
+    };
+    const ne_lat = num("ne_lat"), ne_lng = num("ne_lng");
+    const sw_lat = num("sw_lat"), sw_lng = num("sw_lng");
+    let boundingBox = null;
+    if (ne_lat !== null && ne_lng !== null && sw_lat !== null && sw_lng !== null) {
+        const latSpan = ne_lat - sw_lat;
+        const lngSpan = ne_lng - sw_lng;
+        // Longitude degrees shrink toward the poles; without the cosine term a box over
+        // Scandinavia reads twice as wide as it is.
+        const midLat = ((ne_lat + sw_lat) / 2) * (Math.PI / 180);
+        boundingBox = {
+            ne_lat, ne_lng, sw_lat, sw_lng,
+            approxHeightKm: Math.round(latSpan * 111),
+            approxWidthKm: Math.round(lngSpan * 111 * Math.cos(midLat)),
+        };
+    }
+    const pageCount = Array.isArray(pageCursors) ? pageCursors.length : 0;
+    return {
+        // null means Airbnb geocoded the location itself rather than us supplying a box.
+        boundingBox,
+        resultCount,
+        pageCount,
+        // Airbnb lays out 18 slots per page, but a date-filtered search leaves the
+        // unavailable ones out, so pages come back partly full (measured: 9-11 of 18 for a
+        // fixed 5-night window). Deriving the ceiling from THIS page's count would swing the
+        // estimate with whichever page happened to be fetched, so bound it by the layout and
+        // label it an upper bound.
+        approxMaxRetrievableResults: pageCount * PAGE_SLOTS,
+        ...(skipped ? { skippedUnparseableResults: skipped } : {}),
+    };
+}
 // API handlers
 async function handleAirbnbSearch(params) {
     const { location, placeId, checkin, checkout, adults = 1, children = 0, infants = 0, pets = 0, minPrice, maxPrice, cursor, propertyType, currency = DEFAULT_CURRENCY, ignoreRobotsText = false, } = params;
@@ -606,6 +662,7 @@ async function handleAirbnbSearch(params) {
         const $ = cheerio.load(page.html);
         let staysSearchResults = {};
         let scriptContent = '';
+        let skipped = 0;
         try {
             const scriptElement = $("#data-deferred-state-0").first();
             if (scriptElement.length === 0) {
@@ -622,7 +679,6 @@ async function handleAirbnbSearch(params) {
             }
             cleanObject(results);
             const rawResults = Array.isArray(results.searchResults) ? results.searchResults : [];
-            let skipped = 0;
             staysSearchResults = {
                 searchResults: rawResults
                     .map((result) => {
@@ -676,6 +732,7 @@ async function handleAirbnbSearch(params) {
                     type: "text",
                     text: JSON.stringify({
                         searchUrl: fetchedUrl,
+                        searchMetadata: buildSearchMetadata(searchUrl, staysSearchResults.searchResults?.length ?? 0, staysSearchResults.paginationInfo?.pageCursors, skipped),
                         ...staysSearchResults
                     }, null, 2)
                 }],
