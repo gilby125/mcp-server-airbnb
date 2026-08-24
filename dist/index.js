@@ -89,6 +89,22 @@ const AIRBNB_SEARCH_TOOL = {
                 type: "string",
                 description: "ISO currency code for prices (e.g. USD, EUR, GBP). Defaults to whatever Airbnb picks for your IP's country, which is not necessarily your own \u2014 set this explicitly when on a VPN."
             },
+            ne_lat: {
+                type: "number",
+                description: "North-east corner latitude of an explicit search box. Supply all four of ne_lat/ne_lng/sw_lat/sw_lng together, alongside location, to search that box instead of the one geocoded from the location name. This is how you cover a region: split it into adjacent boxes and search each, since any single query is capped at ~270 results."
+            },
+            ne_lng: {
+                type: "number",
+                description: "North-east corner longitude. See ne_lat."
+            },
+            sw_lat: {
+                type: "number",
+                description: "South-west corner latitude. See ne_lat."
+            },
+            sw_lng: {
+                type: "number",
+                description: "South-west corner longitude. See ne_lat."
+            },
             ignoreRobotsText: {
                 type: "boolean",
                 description: "Ignore robots.txt rules for this request"
@@ -656,6 +672,46 @@ function describeMissingDataScript(html) {
 }
 // A real page is ~850KB; the block page is a small fraction of that.
 const SOFT_BLOCK_MAX_BYTES = 100 * 1024;
+/**
+ * Validate a caller-supplied search box, or return null when none was given.
+ *
+ * Every failure here throws rather than falling back to geocoding the location name. A
+ * bad box that quietly became "whatever the name resolved to" would return a plausible
+ * page of results for the wrong area, and the caller tiling a region would fold that
+ * into their sweep without ever seeing that a tile had silently moved.
+ */
+function parseExplicitBounds(input) {
+    const keys = ["ne_lat", "ne_lng", "sw_lat", "sw_lng"];
+    const supplied = keys.filter(k => input[k] !== undefined && input[k] !== null);
+    if (supplied.length === 0)
+        return null;
+    if (supplied.length !== keys.length) {
+        const missing = keys.filter(k => !supplied.includes(k));
+        throw new McpError(ErrorCode.InvalidParams, `A search box needs all four corners; missing: ${missing.join(", ")}`);
+    }
+    const values = {};
+    for (const key of keys) {
+        const value = Number(input[key]);
+        if (!Number.isFinite(value)) {
+            throw new McpError(ErrorCode.InvalidParams, `${key} must be a number, got ${JSON.stringify(input[key])}`);
+        }
+        const limit = key.endsWith("lat") ? 90 : 180;
+        if (Math.abs(value) > limit) {
+            throw new McpError(ErrorCode.InvalidParams, `${key} must be between -${limit} and ${limit}, got ${value}`);
+        }
+        values[key] = value;
+    }
+    if (values.ne_lat <= values.sw_lat) {
+        throw new McpError(ErrorCode.InvalidParams, `ne_lat (${values.ne_lat}) must be north of sw_lat (${values.sw_lat}) \u2014 corners may be swapped`);
+    }
+    if (values.ne_lng <= values.sw_lng) {
+        // A box spanning the antimeridian is legitimately expressed this way, but Airbnb is
+        // not known to accept it and silently searching the inverted remainder of the globe
+        // would be worse than saying so.
+        throw new McpError(ErrorCode.InvalidParams, `ne_lng (${values.ne_lng}) must be east of sw_lng (${values.sw_lng}). Boxes crossing the antimeridian are not supported; split into two.`);
+    }
+    return values;
+}
 const PAGE_SLOTS = 18;
 function buildSearchMetadata(searchUrl, resultCount, pageCursors, skipped) {
     const num = (key) => {
@@ -697,7 +753,8 @@ function buildSearchMetadata(searchUrl, resultCount, pageCursors, skipped) {
 }
 // API handlers
 async function handleAirbnbSearch(params) {
-    const { location, placeId, checkin, checkout, adults = 1, children = 0, infants = 0, pets = 0, minPrice, maxPrice, cursor, propertyType, currency = DEFAULT_CURRENCY, ignoreRobotsText = false, } = params;
+    const { location, placeId, checkin, checkout, adults = 1, children = 0, infants = 0, pets = 0, minPrice, maxPrice, cursor, propertyType, currency = DEFAULT_CURRENCY, ne_lat, ne_lng, sw_lat, sw_lng, ignoreRobotsText = false, } = params;
+    const explicitBounds = parseExplicitBounds({ ne_lat, ne_lng, sw_lat, sw_lng });
     // Build search URL
     // Airbnb path segments use "--" as the separator (e.g. "Paris--France"),
     // not URL-encoded punctuation.  encodeURIComponent turns commas into %2C
@@ -709,6 +766,11 @@ async function handleAirbnbSearch(params) {
     // validate arguments against inputSchema, so nothing caught it earlier.
     if (!location && !placeId) {
         throw new McpError(ErrorCode.InvalidParams, "Either 'location' or 'placeId' is required");
+    }
+    // Verified: /s/homes with a box but no location slug returns a page with no listing
+    // data at all, so the box cannot stand on its own.
+    if (explicitBounds && !location) {
+        throw new McpError(ErrorCode.InvalidParams, "A search box also needs 'location' \u2014 Airbnb returns no results for a box without a location in the path. Use the name of the region the box sits in.");
     }
     const searchPath = location
         ? `/s/${encodeURIComponent(location
@@ -724,10 +786,21 @@ async function handleAirbnbSearch(params) {
     // Add placeId
     if (placeId)
         searchUrl.searchParams.append("place_id", placeId);
-    // Geocode and add bounding box to fix broken server-side geocoding.
-    // Skipped when placeId is supplied (Airbnb's place lookup is reliable for those)
-    // or when DISABLE_GEOCODING=true (user opt-out from third-party calls).
-    if (!placeId && location && !DISABLE_GEOCODING) {
+    // An explicit box beats geocoding it from the name — the caller has already said
+    // exactly what they want, and re-deriving it could only be worse. Verified that the
+    // box wins over the path slug: the Crete slug with a Chania-sized box returned 0 of 18
+    // listings from eastern Crete, against 8 of 18 without it.
+    if (explicitBounds) {
+        searchUrl.searchParams.append("ne_lat", explicitBounds.ne_lat.toFixed(7));
+        searchUrl.searchParams.append("ne_lng", explicitBounds.ne_lng.toFixed(7));
+        searchUrl.searchParams.append("sw_lat", explicitBounds.sw_lat.toFixed(7));
+        searchUrl.searchParams.append("sw_lng", explicitBounds.sw_lng.toFixed(7));
+        log('info', 'Using caller-supplied bounding box', explicitBounds);
+    }
+    else if (!placeId && location && !DISABLE_GEOCODING) {
+        // Geocode and add bounding box to fix broken server-side geocoding.
+        // Skipped when placeId is supplied (Airbnb's place lookup is reliable for those)
+        // or when DISABLE_GEOCODING=true (user opt-out from third-party calls).
         const coords = await geocodeLocation(location);
         if (coords) {
             searchUrl.searchParams.append("ne_lat", coords.ne_lat);
