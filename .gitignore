@@ -1,3 +1,5 @@
-dist
+# dist/ is intentionally tracked on this fork: `npm i -g github:...` does not
+# install devDependencies, so there is no tsc available to build on install.
+# Run `npm run build` before committing source changes.
 node_modules
 *.mcpb
