@@ -6,7 +6,8 @@ import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, extractDescription, extractLocation, extractHouseRules, keyAmenityGroups } from "./util.js";
 import robotsParser from "robots-parser";
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, openSync, closeSync, unlinkSync, statSync } from 'fs';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 // Get version from package.json
@@ -320,12 +321,12 @@ async function fetchRobotsTxt() {
         // Add timeout to prevent hanging
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-        const response = await fetch(`${BASE_URL}/robots.txt`, {
+        const response = await acquireRequestSlot(() => fetch(`${BASE_URL}/robots.txt`, {
             headers: {
                 "User-Agent": USER_AGENT,
             },
             signal: controller.signal
-        });
+        }));
         clearTimeout(timeoutId);
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -360,11 +361,112 @@ function isPathAllowed(path) {
         return true; // If parsing fails, be permissive
     }
 }
+// ---------------------------------------------------------------------------
+// Outbound request gate
+//
+// Every request to Airbnb in this process goes through acquireRequestSlot(). It is a
+// gate rather than a guideline because the failure it prevents is one the caller cannot
+// see: a burst gets soft-blocked with a 200 and an empty page, and the tool that issued
+// it reports a parse failure. Documenting "space out bulk searches" does not prevent
+// that — a model fanning out searches, or a test suite spawning a server per case, will
+// hammer regardless of what the docs say. So the pacing is enforced here, where no
+// caller can route around it.
+//
+// Two layers, because one process is not the boundary that matters:
+//   - In-process: requests are serialised through a promise chain, one in flight at a
+//     time, with a minimum gap between them.
+//   - Cross-process: the last request time is also kept in a temp file, so a fresh
+//     server (npx spawn, per-case test process) still waits behind the previous one's
+//     request instead of starting its own burst.
+// ---------------------------------------------------------------------------
+const MIN_REQUEST_INTERVAL_MS = Math.max(0, Number(process.env.AIRBNB_MIN_REQUEST_INTERVAL_MS ?? 1200));
+const MAX_RATE_LIMIT_RETRIES = Math.max(0, Number(process.env.AIRBNB_MAX_RETRIES ?? 3));
+// Sized against the throttle observed here, which cleared inside a minute.
+const RATE_LIMIT_BACKOFF_MS = [3000, 10000, 30000];
+const LOCK_WAIT_MS = 3000;
+const STALE_LOCK_MS = 5000;
+const PACE_FILE = join(tmpdir(), "mcp-server-airbnb-last-request");
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// Advisory only: a torn read or a missing file just means we do not wait, which is the
+// same position we would be in without the file at all. Never let it break a request.
+function readNextAllowedAt() {
+    try {
+        const parsed = Number(readFileSync(PACE_FILE, "utf8"));
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+    catch {
+        return 0;
+    }
+}
+/**
+ * Claim the next outbound slot, atomically with respect to other server processes.
+ *
+ * Reading the last request time and writing it after the request completes is a race:
+ * three servers starting together all read the same stale value, all see no reason to
+ * wait, and all fire at once — measured at 49ms apart, which is the burst this gate
+ * exists to prevent. So the slot is *reserved* before the request rather than recorded
+ * after it, and the read-compute-write is serialised by an O_EXCL lock file, which is
+ * the one atomic primitive available across unrelated processes.
+ *
+ * Every failure path here degrades to "go now" rather than throwing: pacing is a
+ * courtesy to Airbnb, and a read-only tmpdir must not take the server down with it.
+ */
+async function reserveRequestSlot() {
+    const lockPath = `${PACE_FILE}.lock`;
+    const giveUpAt = Date.now() + LOCK_WAIT_MS;
+    let holdingLock = false;
+    while (Date.now() < giveUpAt) {
+        try {
+            closeSync(openSync(lockPath, "wx"));
+            holdingLock = true;
+            break;
+        }
+        catch {
+            // A process killed mid-claim would otherwise block every future request forever.
+            try {
+                if (Date.now() - statSync(lockPath).mtimeMs > STALE_LOCK_MS)
+                    unlinkSync(lockPath);
+            }
+            catch { /* someone else cleared it first */ }
+            await sleep(25);
+        }
+    }
+    try {
+        const at = Math.max(Date.now(), readNextAllowedAt() + MIN_REQUEST_INTERVAL_MS);
+        try {
+            writeFileSync(PACE_FILE, String(at));
+        }
+        catch { /* best effort */ }
+        return at;
+    }
+    finally {
+        if (holdingLock) {
+            try {
+                unlinkSync(lockPath);
+            }
+            catch { /* best effort */ }
+        }
+    }
+}
+let requestChain = Promise.resolve();
+function acquireRequestSlot(task) {
+    const run = requestChain.then(async () => {
+        const goAt = await reserveRequestSlot();
+        const wait = goAt - Date.now();
+        if (wait > 0)
+            await sleep(wait);
+        return task();
+    });
+    // Keep the chain alive across a failed task, or one rejection stalls every request
+    // queued behind it for the life of the process.
+    requestChain = run.then(() => undefined, () => undefined);
+    return run;
+}
 async function fetchWithUserAgent(url, timeout = 30000) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
     try {
-        const response = await fetch(url, {
+        const response = await acquireRequestSlot(() => fetch(url, {
             headers: {
                 "User-Agent": USER_AGENT,
                 "Accept-Language": "en-US,en;q=0.9",
@@ -372,7 +474,7 @@ async function fetchWithUserAgent(url, timeout = 30000) {
                 "Cache-Control": "no-cache",
             },
             signal: controller.signal
-        });
+        }));
         clearTimeout(timeoutId);
         if (response.status === 429 || response.status === 503) {
             // Airbnb sends no Retry-After, and the throttle observed here cleared within about
@@ -419,9 +521,55 @@ function detectDomainHandoff(html) {
     const match = html.slice(0, 4096).match(DOMAIN_HANDOFF_PATTERN);
     return match ? match[1] : null;
 }
+/**
+ * A soft block and a real page are told apart by size before any parsing happens, so the
+ * retry can fire on the block instead of surfacing it as a parse failure downstream.
+ */
+function looksRateLimited(html) {
+    return html.length < SOFT_BLOCK_MAX_BYTES && !html.includes("data-deferred-state-0");
+}
+/**
+ * Fetch, and absorb a throttle rather than handing it to the caller.
+ *
+ * Airbnb throttles two ways — an explicit 429/503, and a 200 carrying a short empty page
+ * — and sends no Retry-After for either, so the delay is ours to choose. The observed
+ * block cleared inside a minute, which the backoff schedule is sized against.
+ */
+async function fetchHtmlWithBackoff(target, timeout) {
+    for (let attempt = 0;; attempt++) {
+        let html = null;
+        let rateLimitError = null;
+        try {
+            html = await (await fetchWithUserAgent(target, timeout)).text();
+            if (!looksRateLimited(html))
+                return html;
+        }
+        catch (error) {
+            // fetchWithUserAgent turns 429/503 into an Error; anything else is a real failure
+            // and must propagate untouched rather than being retried as a throttle.
+            if (!(error instanceof Error) || !/^Rate limited by Airbnb/.test(error.message))
+                throw error;
+            rateLimitError = error;
+        }
+        if (attempt >= MAX_RATE_LIMIT_RETRIES) {
+            if (rateLimitError)
+                throw rateLimitError;
+            return html; // let the parser report the empty page it got
+        }
+        const backoffMs = RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
+        log('warn', 'Rate limited by Airbnb, backing off', {
+            url: target,
+            attempt: attempt + 1,
+            of: MAX_RATE_LIMIT_RETRIES,
+            waitMs: backoffMs,
+            kind: rateLimitError ? 'http-429' : 'soft-block',
+        });
+        await sleep(backoffMs);
+    }
+}
 async function fetchPage(url, timeout = 30000) {
     let target = withResolvedOrigin(url);
-    let html = await (await fetchWithUserAgent(target, timeout)).text();
+    let html = await fetchHtmlWithBackoff(target, timeout);
     const handoff = detectDomainHandoff(html);
     if (!handoff)
         return { html, url: target };
@@ -436,7 +584,7 @@ async function fetchPage(url, timeout = 30000) {
     }
     log('info', 'Following Airbnb domain handoff', { from: target, to: retryTarget });
     target = retryTarget;
-    html = await (await fetchWithUserAgent(target, timeout)).text();
+    html = await fetchHtmlWithBackoff(target, timeout);
     if (detectDomainHandoff(html)) {
         // Nowhere better to go. Return what we have and let the parse path report it.
         log('warn', 'Domain handoff repeated after retry', { url: target });
